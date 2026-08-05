@@ -1,4 +1,4 @@
-Name:           greetd
+Name:           greetd-playtron
 Epoch:          1
 Version: 0.10.3
 Release:        1%{?dist}
