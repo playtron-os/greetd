@@ -102,6 +102,23 @@ impl SessionChildToParent {
 /// The entry point for the session worker process. The session worker is
 /// responsible for the entirety of the session setup and execution. It is
 /// started by Session::start.
+/// Record the authenticated uid for a compositor shared across sessions. Written as root, before
+/// privileges are dropped, and replaced on every session start -- including the greeter's, so a
+/// reader always sees the session that is actually starting rather than a stale one.
+fn publish_session_uid(uid: u32) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = std::path::Path::new("/run/greetd");
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(".session-uid.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+        writeln!(f, "{uid}")?;
+    }
+    std::fs::rename(tmp, dir.join("session-uid"))
+}
+
 fn worker(sock: &UnixDatagram) -> Result<(), Error> {
     let mut data = [0; 10240];
     let (service, class, user, authenticate, tty, source_profile, listener_path) =
@@ -182,6 +199,7 @@ fn worker(sock: &UnixDatagram) -> Result<(), Error> {
             // Tell PAM what TTY we're targeting, which is used by logind.
             pam.set_item(PamItemType::TTY, &format!("tty{vt}"))?;
             pam.putenv(&format!("XDG_VTNR={vt}"))?;
+            pam.putenv("XDG_SEAT=seat0")?;
 
             // Opening our target terminal.
             let target_term = terminal::Terminal::open(&path)?;
@@ -213,7 +231,6 @@ fn worker(sock: &UnixDatagram) -> Result<(), Error> {
     // specifically, pam_systemd.so), as well as make it easier to gather
     // and set all environment variables later.
     let prepared_env = [
-        "XDG_SEAT=seat0".to_string(),
         format!("XDG_SESSION_CLASS={}", class.as_str()),
         format!("USER={}", user.name),
         format!("LOGNAME={}", user.name),
@@ -233,6 +250,17 @@ fn worker(sock: &UnixDatagram) -> Result<(), Error> {
 
     // We are done with PAM, clear variables that the child will not need.
     _ = pam.putenv("XDG_SESSION_CLASS");
+
+    // Publish who was just authenticated, while we are still root.
+    //
+    // A shared compositor that outlives sessions (the persistent-compositor model) cannot
+    // otherwise tell whose session now owns the screen: it has no seat to ask logind about, and
+    // inferring it from which client draws first is a race any local client could win. This file
+    // is the answer from the only party that knows -- and, being written by a root daemon users
+    // cannot invoke, one they cannot forge. Non-secret: it holds a uid.
+    if let Err(e) = publish_session_uid(user.uid.as_raw()) {
+        eprintln!("unable to publish session uid: {e}");
+    }
 
     // Prepare some strings in C format that we'll need.
     let cusername = CString::new(user.name)?;
